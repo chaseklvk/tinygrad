@@ -288,3 +288,80 @@ class PTXLanguage(AssemblyLanguage):
             "\n}")
 
 PTXRenderer = functools.partial(uops_to_asm, PTXLanguage())
+
+class TinyLang(AssemblyLanguage):
+  kernel_prefix = """.version VERSION
+    .target TARGET
+    .address_size 64
+    .visible .entry"""
+  barrier = "bar.sync\t0;"
+  has_pred = True
+  load_global = True
+  label_prefix = "$"
+  gid = [f'%ctaid.{chr(120+i)}' for i in range(3)]
+  gdim = [f'%nctaid.{chr(120+i)}' for i in range(3)]
+  lid = [f'%tid.{chr(120+i)}' for i in range(3)]
+  asm_for_op = {
+    UnaryOps.NEG: lambda d,a,dt,name: f"not.pred {d}, {a};" if name == "pred" else f"neg.{name} {d}, {a};",
+    UnaryOps.EXP2: lambda d,a,dt,name: f"ex2.approx.{name} {d}, {a};", UnaryOps.LOG2: lambda d,a,dt,name: f"lg2.approx.{name} {d}, {a};",
+    UnaryOps.SIN: lambda d,a,dt,name: f"sin.approx.{name} {d}, {a};", UnaryOps.SQRT: lambda d,a,dt,name: f"sqrt.approx.{name} {d}, {a};",
+    BinaryOps.ADD: lambda d,a,b,dt,name: f"{'or' if name == 'pred' else 'add'}.{name} {d}, {a}, {b};",
+    BinaryOps.SUB: lambda d,a,b,dt,name: f"sub.{name} {d}, {a}, {b};",
+    BinaryOps.MUL: lambda d,a,b,dt,name: ('and' if dt == dtypes.bool else 'mul') + f"{'.lo' if dtypes.is_int(dt) else ''}.{name} {d}, {a}, {b};",
+    BinaryOps.XOR: lambda d,a,b,dt,name: f"xor.pred {d}, {a}, {b};" if name == "pred" else f"xor.b{name[1:]} {d}, {a}, {b};",
+    BinaryOps.DIV: lambda d,a,b,dt,name: f"div{'.approx' if dtypes.is_float(dt) else ''}.{name} {d}, {a}, {b};",
+    BinaryOps.MAX: lambda d,a,b,dt,name: f"max.{name} {d}, {a}, {b};", BinaryOps.MOD: lambda d,a,b,dt,name: f"rem.{name} {d}, {a}, {b};",
+    BinaryOps.CMPLT: lambda d,a,b,dt,name: f"setp.lt.{name} {d}, {a}, {b};",
+    BinaryOps.CMPEQ: lambda d,a,b,dt,name: f"setp.eq.{name} {d}, {a}, {b};",
+    TernaryOps.MULACC: lambda d,a,b,c,dt,name: f"fma.rn.{name} {d}, {a}, {b}, {c};",
+    TernaryOps.WHERE: lambda d,a,b,c,dt,name:
+      f"@{a} mov.{name} {d}, {b};\n@!{a} mov.{name} {d}, {c};" if name == "pred" else f"selp.{'b16' if name == 'f16' else name} {d}, {b}, {c}, {a};"
+  }
+  supports_half = [UnaryOps.NEG, UnaryOps.EXP2, BinaryOps.ADD, BinaryOps.SUB, BinaryOps.MUL, BinaryOps.MAX, BinaryOps.CMPLT, TernaryOps.WHERE]
+  # HACK: Use s16 and u16 for int8 and uint8 buffers. This can be wrong in cast.
+  types = { dtypes.int8: "s16", dtypes.int16: "s16", dtypes.int32: "s32", dtypes.int64: "s64",
+            dtypes.uint8: "u16", dtypes.uint16: "u16", dtypes.uint32: "u32", dtypes.uint64: "u64",
+            dtypes.float16: "f16", dtypes.float32: "f32", dtypes.float64: "f64", dtypes.bool: "pred" }
+
+  const_requires_mov = [dtypes.half, dtypes.bool]
+
+  def render_const(self, x:ConstType, dtype:DType, mov=None) -> Union[List[str], str]:
+    val = render_val(x, dtype)
+    if dtype == dtypes.bool: return [f"setp.ne.s16 {mov}, {val}, 0;"]
+    return [f"mov.b{self.types[dtype][1:]} {mov}, {val};"] if mov else val
+
+  def render_local(self, dest, name, size, dtype) -> List[str]:
+    return [f".shared .align 4 .b8 {name}[{size*dtype.itemsize}];", f"mov.u64 {dest}, {name}[0];"]
+
+  def render_loop(self, idx, start, label, acc=None) -> List[str]: return [f"mov.u32 {idx}, {start};", f"{label}:"]
+
+  def render_bra(self, b1, pred=None, b2=None) -> List[str]: return [f"@{pred} bra {b1};", f"@!{pred} bra {b2};"] if pred else [f"bra {b1};"]
+
+  def mem_type(self, dtype): return 's8' if dtype.itemsize == 1 else 'b16' if dtype == dtypes.float16 else self.types[dtype]
+
+  def render_load(self, loc, dest, dtype, gate=None, alt=None, ss="", offset=0) -> List[str]:
+    assert dtype is not dtypes.bool
+    if gate: return [f"@{gate} ld{ss}.{self.mem_type(dtype)} {dest}, [{loc}+{offset}];", f"@!{gate} mov.b{self.types[dtype][1:]} {dest}, {alt};"]
+    else: return [f"ld{ss}.{self.mem_type(dtype)} {dest}, [{loc}+{offset}];"]
+
+  def render_store(self, loc, val, dtype, gate=None, ss="", offset=0) -> List[str]:
+    return [(f"@{gate} " if gate else "") + f"st{ss}.{self.mem_type(dtype)} [{loc}+{offset}], {val};"]
+
+  def render_cast(self, d:str, a:str, dtype:DType, atype:DType, bitcast=False, pred=False) -> List[str]:
+    if bitcast: return [f"mov.b{self.types[dtype][1:]} {d}, {a};"]
+    if atype == dtypes.bool: return[f"selp.b{self.types[dtype][1:]} {d}, {render_val(1, dtype)}, {render_val(0, dtype)}, {a};"]
+    if dtype == dtypes.bool: return [f"setp.ne.b{self.types[atype][1:]} {d}, {a}, {self.render_const(0, atype)};"]
+    rnd = ('.rzi' if dtypes.is_int(dtype) and dtypes.is_float(atype) else
+           '.rn' if dtypes.is_float(dtype) and (dtype.itemsize < atype.itemsize or dtypes.is_int(atype) or atype == dtypes.bool) else '')
+    return [f"cvt{rnd}.{self.types[dtype]}.{self.types[atype]} {d}, {a};"]
+
+  def render_kernel(self, kernel, function_name, bufs, regs) -> str:
+    kernel = [f".reg .{reg.split('_')[-2]} %{reg}<{cnt}>;" for reg,cnt in regs] + kernel + ["ret;"]
+    def fmt(line): return line if line[0]=="$" else "\t" + line.replace(" ", "\t" if len(line.split(" ")[0]) > 7 else "\t\t", 1)
+    return (f"{self.kernel_prefix} {function_name}(\n\t" +
+            ',\n\t'.join([f".param .{'u64' if dtype.__class__ == PtrDType else self.types[dtype]} {name}" for name,dtype in bufs]) + "\n)\n{\n" +
+            '\n'.join([fmt(line) for op in kernel for line in op.splitlines()]) +
+            "\n}")
+
+
+TinyRenderer = functools.partial(uops_to_asm, TinyLang())
